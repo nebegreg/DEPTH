@@ -1,0 +1,70 @@
+# Depth Anything v3 Professional GUI - Requirements
+# =================================================
+
+# Core dependencies
+torch>=2.0.0
+torchvision>=0.15.0
+numpy<2.0.0
+
+# PyQt6 for GUI
+PyQt6>=6.4.0
+PyQt6-Qt6>=6.4.0
+
+# Image and video processing
+opencv-python>=4.7.0
+Pillow>=9.5.0
+imageio>=2.27.0
+moviepy>=1.0.3
+pillow-heif>=0.10.0
+
+# 3D visualization and processing
+open3d>=0.17.0
+trimesh>=3.21.0
+plyfile>=0.9.0
+
+# Depth Anything v3 dependencies
+huggingface_hub>=0.14.0
+safetensors>=0.3.1
+einops>=0.6.1
+omegaconf>=2.3.0
+
+# Performance optimization
+xformers>=0.0.20  # For efficient attention (optional but recommended)
+
+# 3D Gaussians support (optional)
+# Uncomment if you want to use Gaussian splatting features
+# diff-gaussian-rasterization
+# simple-knn
+
+# Additional utilities
+fastapi>=0.95.0
+uvicorn>=0.21.0
+requests>=2.28.0
+typer>=0.9.0
+evo>=1.20.0
+e3nn>=0.5.0
+pycolmap>=0.4.0
+
+# Development tools (optional)
+pre-commit>=3.0.0
+
+# Notes:
+# ------
+# 1. For CUDA support, install PyTorch with CUDA:
+#    pip install torch torchvision --index-url https://download.pytorch.org/whl/cu118
+#
+# 2. xformers may require specific CUDA version. If installation fails:
+#    pip install xformers --no-deps
+#    Or skip it (performance will be slightly reduced)
+#
+# 3. For older GPUs without xformers support, see:
+#    https://github.com/ByteDance-Seed/Depth-Anything-3/issues/11
+#
+# 4. Recommended: Create a virtual environment first:
+#    python -m venv venv
+#    source venv/bin/activate  # On Windows: venv\Scripts\activate
+#    pip install -r requirements_gui.txt
+#
+# 5. For the core Depth Anything v3 package:
+#    cd Depth-Anything-3-main
+#    pip install -e .
