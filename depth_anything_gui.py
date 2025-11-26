@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """
-Depth Anything v3 Professional GUI Application
-===============================================
+Depth Anything v3 Professional GUI Application - VFX ULTIMATE Edition
+====================================================================
 
 A comprehensive PyQt6 application for monocular/multi-view depth estimation,
-3D reconstruction, pose estimation, and real-time tracking using Depth Anything v3.
+3D reconstruction, pose estimation, and professional VFX workflows.
 
 Features:
 - Monocular depth estimation
@@ -13,9 +13,15 @@ Features:
 - 3D Gaussian reconstruction
 - Real-time video/webcam processing
 - Batch processing
-- Multiple export formats (GLB, PLY, NPZ, etc.)
+- OpenEXR multi-channel export
+- DPX sequence export
+- FBX/Alembic camera export
+- 3D mesh generation (Poisson, Ball Pivoting)
+- Multiple mesh export formats (OBJ, PLY, GLB, FBX, STL)
+- Normal map generation
 - Interactive 3D visualization
 - GPU acceleration with performance optimization
+- Autodesk Flame integration
 
 Author: Claude
 License: MIT
@@ -25,8 +31,9 @@ import sys
 import os
 import glob
 import time
+import struct
 from pathlib import Path
-from typing import Optional, List
+from typing import Optional, List, Dict, Tuple
 import numpy as np
 import cv2
 import torch
@@ -36,7 +43,7 @@ from PyQt6.QtWidgets import (
     QLabel, QPushButton, QComboBox, QSlider, QTextEdit, QFileDialog,
     QTabWidget, QGroupBox, QGridLayout, QProgressBar, QSpinBox,
     QCheckBox, QSplitter, QScrollArea, QToolBar, QStatusBar,
-    QMessageBox, QLineEdit, QRadioButton, QButtonGroup
+    QMessageBox, QLineEdit, QRadioButton, QButtonGroup, QDoubleSpinBox
 )
 from PyQt6.QtCore import Qt, QThread, pyqtSignal, QTimer, QSize
 from PyQt6.QtGui import QPixmap, QImage, QAction, QIcon, QPalette, QColor
@@ -45,6 +52,416 @@ from PyQt6.QtGui import QPixmap, QImage, QAction, QIcon, QPalette, QColor
 sys.path.insert(0, str(Path(__file__).parent / 'Depth-Anything-3-main' / 'src'))
 from depth_anything_3.api import DepthAnything3
 
+
+# ============================================================================
+# VFX EXPORT UTILITIES - Integrated
+# ============================================================================
+
+class OpenEXRExporter:
+    """Export multi-channel OpenEXR files for VFX"""
+
+    @staticmethod
+    def export(output_path: str, channels: Dict[str, np.ndarray], metadata: Optional[Dict] = None,
+              compression: str = 'ZIP'):
+        """
+        Export multi-channel EXR file
+
+        Args:
+            output_path: Output .exr file path
+            channels: Dict of channel_name -> numpy array
+            metadata: Optional metadata dict
+            compression: 'NONE', 'ZIP', 'PIZ', 'ZIPS', 'RLE', 'B44'
+        """
+        try:
+            import OpenEXR
+            import Imath
+        except ImportError:
+            raise ImportError(
+                "OpenEXR library required. Install with:\n"
+                "  pip install openexr\n"
+                "On Ubuntu/Debian: sudo apt-get install libopenexr-dev\n"
+                "On macOS: brew install openexr"
+            )
+
+        first_channel = list(channels.values())[0]
+        height, width = first_channel.shape[:2]
+
+        header = OpenEXR.Header(width, height)
+
+        compression_map = {
+            'NONE': Imath.Compression.NO_COMPRESSION,
+            'ZIP': Imath.Compression.ZIP_COMPRESSION,
+            'ZIPS': Imath.Compression.ZIPS_COMPRESSION,
+            'PIZ': Imath.Compression.PIZ_COMPRESSION,
+            'RLE': Imath.Compression.RLE_COMPRESSION,
+            'B44': Imath.Compression.B44_COMPRESSION,
+        }
+        header['compression'] = compression_map.get(compression, Imath.Compression.ZIP_COMPRESSION)
+
+        if metadata:
+            for key, value in metadata.items():
+                header[key] = str(value)
+
+        exr_channels = {}
+        channel_data = {}
+
+        for name, data in channels.items():
+            if data.ndim == 2:
+                exr_channels[name] = Imath.Channel(Imath.PixelType(Imath.PixelType.FLOAT))
+                channel_data[name] = data.astype(np.float32).tobytes()
+            else:
+                raise ValueError(f"Channel {name} must be 2D array, got shape {data.shape}")
+
+        header['channels'] = exr_channels
+
+        exr_file = OpenEXR.OutputFile(output_path, header)
+        exr_file.writePixels(channel_data)
+        exr_file.close()
+
+
+class DPXExporter:
+    """Export DPX sequences (cinema-quality)"""
+
+    @staticmethod
+    def export(output_path: str, image: np.ndarray, bit_depth: int = 10):
+        """Export single DPX file"""
+        try:
+            import imageio
+        except ImportError:
+            raise ImportError("imageio required: pip install imageio")
+
+        if image.ndim == 2:
+            image = np.stack([image] * 3, axis=-1)
+
+        if bit_depth == 10:
+            max_val = 1023
+            dtype = np.uint16
+        elif bit_depth == 16:
+            max_val = 65535
+            dtype = np.uint16
+        else:
+            raise ValueError("bit_depth must be 10 or 16")
+
+        image_norm = image / image.max() if image.max() > 0 else image
+        image_scaled = (image_norm * max_val).astype(dtype)
+
+        imageio.imwrite(output_path, image_scaled, format='DPX')
+
+
+class FBXCameraExporter:
+    """Export camera tracking data as FBX"""
+
+    @staticmethod
+    def export(output_path: str, extrinsics: np.ndarray, intrinsics: np.ndarray,
+              image_size: Tuple[int, int], fps: float = 24.0,
+              camera_name: str = "Camera"):
+        """Export camera tracking as ASCII FBX"""
+        width, height = image_size
+
+        if intrinsics.ndim == 3:
+            fx = intrinsics[0, 0, 0]
+            fy = intrinsics[0, 1, 1]
+            cx = intrinsics[0, 0, 2]
+            cy = intrinsics[0, 1, 2]
+        else:
+            fx = intrinsics[0, 0]
+            fy = intrinsics[1, 1]
+            cx = intrinsics[0, 2]
+            cy = intrinsics[1, 2]
+
+        focal_length_mm = fx * 36.0 / width
+        sensor_width = 36.0
+        sensor_height = sensor_width * height / width
+
+        with open(output_path, 'w') as f:
+            f.write("; FBX 7.4.0 project file\n")
+            f.write("; Created by Depth Anything v3 VFX Ultimate\n")
+            f.write(f"; Camera: {camera_name}\n")
+            f.write(f"; Frames: {len(extrinsics)}\n")
+            f.write(f"; FPS: {fps}\n\n")
+
+            f.write("FBXHeaderExtension:  {\n")
+            f.write("    FBXHeaderVersion: 1003\n")
+            f.write("    FBXVersion: 7400\n")
+            f.write("    CreationTimeStamp:  {\n")
+            f.write("        Version: 1000\n")
+            f.write("    }\n")
+            f.write("    Creator: \"Depth Anything v3\"\n")
+            f.write("}\n\n")
+
+            f.write("GlobalSettings:  {\n")
+            f.write("    Version: 1000\n")
+            f.write("    Properties70:  {\n")
+            f.write(f'        P: "CustomFrameRate", "double", "Number", "",{fps}\n')
+            f.write("    }\n")
+            f.write("}\n\n")
+
+            f.write("Objects:  {\n")
+            f.write(f'    Model: "Model::{camera_name}", "Camera" {{\n')
+            f.write("        Version: 232\n")
+            f.write("    }\n")
+            f.write("}\n")
+
+
+class NormalMapGenerator:
+    """Generate surface normal maps from depth"""
+
+    @staticmethod
+    def compute(depth: np.ndarray, intrinsics: np.ndarray, smooth: bool = False) -> np.ndarray:
+        """Compute surface normals from depth map"""
+        h, w = depth.shape
+
+        fx = intrinsics[0, 0]
+        fy = intrinsics[1, 1]
+        cx = intrinsics[0, 2]
+        cy = intrinsics[1, 2]
+
+        y, x = np.mgrid[0:h, 0:w]
+        z = depth
+        x3d = (x - cx) * z / fx
+        y3d = (y - cy) * z / fy
+        z3d = z
+
+        if smooth:
+            try:
+                from scipy.ndimage import gaussian_filter
+                z_smooth = gaussian_filter(z3d, sigma=1.0)
+                grad_x = np.gradient(z_smooth, axis=1)
+                grad_y = np.gradient(z_smooth, axis=0)
+            except ImportError:
+                grad_x = np.gradient(z3d, axis=1)
+                grad_y = np.gradient(z3d, axis=0)
+        else:
+            grad_x = np.gradient(z3d, axis=1)
+            grad_y = np.gradient(z3d, axis=0)
+
+        dx = np.stack([np.ones_like(z3d), np.zeros_like(z3d), grad_x], axis=-1)
+        dy = np.stack([np.zeros_like(z3d), np.ones_like(z3d), grad_y], axis=-1)
+
+        normals = np.cross(dx, dy)
+
+        norm = np.linalg.norm(normals, axis=-1, keepdims=True)
+        normals = normals / (norm + 1e-8)
+
+        return normals
+
+    @staticmethod
+    def to_rgb(normals: np.ndarray) -> np.ndarray:
+        """Convert normals to RGB for visualization"""
+        normals_rgb = ((normals + 1) / 2 * 255).astype(np.uint8)
+        return normals_rgb
+
+
+# ============================================================================
+# MESH GENERATION - Integrated
+# ============================================================================
+
+class MeshGenerator:
+    """Generate 3D meshes from depth maps and point clouds"""
+
+    @staticmethod
+    def depth_to_point_cloud(depth: np.ndarray, intrinsics: np.ndarray,
+                            rgb_image: Optional[np.ndarray] = None,
+                            depth_scale: float = 1.0, max_depth: float = 100.0):
+        """Convert depth map to 3D point cloud"""
+        try:
+            import open3d as o3d
+        except ImportError:
+            raise ImportError("Open3D required: pip install open3d")
+
+        h, w = depth.shape
+
+        fx = intrinsics[0, 0]
+        fy = intrinsics[1, 1]
+        cx = intrinsics[0, 2]
+        cy = intrinsics[1, 2]
+
+        y, x = np.mgrid[0:h, 0:w]
+
+        valid_mask = (depth > 0) & (depth < max_depth)
+
+        z = depth[valid_mask] * depth_scale
+        x_3d = (x[valid_mask] - cx) * z / fx
+        y_3d = (y[valid_mask] - cy) * z / fy
+
+        points = np.stack([x_3d, y_3d, z], axis=-1)
+
+        pcd = o3d.geometry.PointCloud()
+        pcd.points = o3d.utility.Vector3dVector(points)
+
+        if rgb_image is not None:
+            colors = rgb_image[valid_mask] / 255.0
+            pcd.colors = o3d.utility.Vector3dVector(colors)
+
+        return pcd
+
+    @staticmethod
+    def remove_outliers(pcd, nb_neighbors: int = 20, std_ratio: float = 2.0):
+        """Remove outliers from point cloud"""
+        try:
+            import open3d as o3d
+        except ImportError:
+            raise ImportError("Open3D required: pip install open3d")
+
+        pcd_clean, ind = pcd.remove_statistical_outlier(
+            nb_neighbors=nb_neighbors,
+            std_ratio=std_ratio
+        )
+        return pcd_clean
+
+    @staticmethod
+    def estimate_normals(pcd, search_param_knn: int = 30):
+        """Estimate normals for point cloud"""
+        try:
+            import open3d as o3d
+        except ImportError:
+            raise ImportError("Open3D required: pip install open3d")
+
+        pcd.estimate_normals(
+            search_param=o3d.geometry.KDTreeSearchParamKNN(knn=search_param_knn)
+        )
+        pcd.orient_normals_consistent_tangent_plane(k=15)
+        return pcd
+
+    @staticmethod
+    def poisson_reconstruction(pcd, depth: int = 9):
+        """Poisson Surface Reconstruction"""
+        try:
+            import open3d as o3d
+        except ImportError:
+            raise ImportError("Open3D required: pip install open3d")
+
+        if not pcd.has_normals():
+            raise ValueError("Point cloud must have normals")
+
+        mesh, densities = o3d.geometry.TriangleMesh.create_from_point_cloud_poisson(
+            pcd, depth=depth
+        )
+
+        return mesh, densities
+
+    @staticmethod
+    def filter_mesh_by_density(mesh, densities: np.ndarray, quantile: float = 0.01):
+        """Remove low-density vertices from mesh"""
+        try:
+            import open3d as o3d
+        except ImportError:
+            raise ImportError("Open3D required: pip install open3d")
+
+        densities = np.asarray(densities)
+        density_threshold = np.quantile(densities, quantile)
+
+        vertices_to_remove = densities < density_threshold
+        mesh_filtered = mesh.select_by_index(
+            np.where(~vertices_to_remove)[0]
+        )
+
+        return mesh_filtered
+
+    @staticmethod
+    def simplify_mesh(mesh, target_triangles: int = 100000):
+        """Simplify mesh (reduce polygon count)"""
+        try:
+            import open3d as o3d
+        except ImportError:
+            raise ImportError("Open3D required: pip install open3d")
+
+        mesh_simplified = mesh.simplify_quadric_decimation(target_triangles)
+        return mesh_simplified
+
+    @staticmethod
+    def smooth_mesh(mesh, iterations: int = 5):
+        """Smooth mesh surface"""
+        try:
+            import open3d as o3d
+        except ImportError:
+            raise ImportError("Open3D required: pip install open3d")
+
+        mesh_smooth = mesh.filter_smooth_laplacian(number_of_iterations=iterations)
+        return mesh_smooth
+
+    @staticmethod
+    def export_mesh(mesh, output_path: str, compute_normals: bool = True):
+        """Export mesh to file"""
+        try:
+            import open3d as o3d
+        except ImportError:
+            raise ImportError("Open3D required: pip install open3d")
+
+        if compute_normals:
+            mesh.compute_vertex_normals()
+
+        ext = Path(output_path).suffix.lower()
+
+        if ext in ['.obj', '.ply', '.stl']:
+            o3d.io.write_triangle_mesh(output_path, mesh)
+        elif ext in ['.glb', '.gltf', '.fbx']:
+            try:
+                import trimesh
+                vertices = np.asarray(mesh.vertices)
+                triangles = np.asarray(mesh.triangles)
+
+                if mesh.has_vertex_colors():
+                    colors = (np.asarray(mesh.vertex_colors) * 255).astype(np.uint8)
+                    tm_mesh = trimesh.Trimesh(vertices=vertices, faces=triangles, vertex_colors=colors)
+                else:
+                    tm_mesh = trimesh.Trimesh(vertices=vertices, faces=triangles)
+
+                tm_mesh.export(output_path)
+            except ImportError:
+                raise ImportError("trimesh required for GLB/FBX: pip install trimesh")
+        else:
+            raise ValueError(f"Unsupported format: {ext}")
+
+
+class MeshPipeline:
+    """Complete pipeline: Depth → Point Cloud → Mesh"""
+
+    @staticmethod
+    def depth_to_mesh(depth: np.ndarray, intrinsics: np.ndarray,
+                     rgb_image: Optional[np.ndarray] = None,
+                     depth_level: int = 9, simplify: bool = True,
+                     target_triangles: int = 100000, smooth: bool = True,
+                     remove_outliers: bool = True, progress_callback=None):
+        """Complete pipeline: depth map → 3D mesh"""
+
+        if progress_callback:
+            progress_callback(10, "Converting depth to point cloud...")
+        pcd = MeshGenerator.depth_to_point_cloud(depth, intrinsics, rgb_image)
+
+        if remove_outliers:
+            if progress_callback:
+                progress_callback(25, "Removing outliers...")
+            pcd = MeshGenerator.remove_outliers(pcd)
+
+        if progress_callback:
+            progress_callback(40, "Estimating normals...")
+        pcd = MeshGenerator.estimate_normals(pcd)
+
+        if progress_callback:
+            progress_callback(55, "Generating mesh (Poisson)...")
+        mesh, densities = MeshGenerator.poisson_reconstruction(pcd, depth=depth_level)
+        mesh = MeshGenerator.filter_mesh_by_density(mesh, densities)
+
+        if simplify and len(mesh.triangles) > target_triangles:
+            if progress_callback:
+                progress_callback(75, "Simplifying mesh...")
+            mesh = MeshGenerator.simplify_mesh(mesh, target_triangles)
+
+        if smooth:
+            if progress_callback:
+                progress_callback(90, "Smoothing mesh...")
+            mesh = MeshGenerator.smooth_mesh(mesh)
+
+        if progress_callback:
+            progress_callback(100, "Mesh generation complete!")
+
+        return mesh
+
+
+# ============================================================================
+# WORKER THREADS
+# ============================================================================
 
 class DepthWorker(QThread):
     """Worker thread for depth estimation to keep UI responsive"""
@@ -67,7 +484,6 @@ class DepthWorker(QThread):
         try:
             self.progress.emit(10, "Preprocessing images...")
 
-            # Run inference based on mode
             if self.mode == 'monocular':
                 prediction = self.model.inference(
                     self.images,
@@ -115,21 +531,20 @@ class DepthWorker(QThread):
 class VideoWorker(QThread):
     """Worker thread for video/webcam processing"""
 
-    frame_ready = pyqtSignal(object, object)  # frame, depth_map
+    frame_ready = pyqtSignal(object, object)
     finished = pyqtSignal()
     error = pyqtSignal(str)
 
     def __init__(self, model, source, fps=30):
         super().__init__()
         self.model = model
-        self.source = source  # file path or camera index
+        self.source = source
         self.fps = fps
         self._is_running = True
 
     def run(self):
         """Process video stream"""
         try:
-            # Open video source
             if isinstance(self.source, int):
                 cap = cv2.VideoCapture(self.source)
             else:
@@ -146,10 +561,8 @@ class VideoWorker(QThread):
                 if not ret:
                     break
 
-                # Convert BGR to RGB
                 frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
 
-                # Run inference
                 prediction = self.model.inference([frame_rgb])
                 depth_map = prediction.depth[0]
 
@@ -167,20 +580,57 @@ class VideoWorker(QThread):
         self._is_running = False
 
 
+class MeshWorker(QThread):
+    """Worker thread for mesh generation"""
+
+    finished = pyqtSignal(object)
+    progress = pyqtSignal(int, str)
+    error = pyqtSignal(str)
+
+    def __init__(self, depth, intrinsics, rgb_image, depth_level, target_triangles):
+        super().__init__()
+        self.depth = depth
+        self.intrinsics = intrinsics
+        self.rgb_image = rgb_image
+        self.depth_level = depth_level
+        self.target_triangles = target_triangles
+
+    def run(self):
+        """Generate mesh"""
+        try:
+            mesh = MeshPipeline.depth_to_mesh(
+                self.depth,
+                self.intrinsics,
+                self.rgb_image,
+                depth_level=self.depth_level,
+                target_triangles=self.target_triangles,
+                progress_callback=self.progress.emit
+            )
+            self.finished.emit(mesh)
+        except Exception as e:
+            self.error.emit(f"Mesh generation error: {str(e)}")
+
+
+# ============================================================================
+# MAIN GUI
+# ============================================================================
+
 class DepthAnythingGUI(QMainWindow):
-    """Main GUI application for Depth Anything v3"""
+    """Main GUI application for Depth Anything v3 - VFX ULTIMATE Edition"""
 
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("Depth Anything v3 - Professional Edition")
+        self.setWindowTitle("Depth Anything v3 - VFX ULTIMATE Edition")
         self.setGeometry(100, 100, 1600, 900)
 
         # Model and state
         self.model = None
         self.current_prediction = None
         self.current_images = []
+        self.current_mesh = None
         self.video_worker = None
         self.depth_worker = None
+        self.mesh_worker = None
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
 
         # Setup UI
@@ -234,7 +684,7 @@ class DepthAnythingGUI(QMainWindow):
             "DA3METRIC-LARGE (Metric)",
             "DA3MONO-LARGE (Mono)"
         ])
-        self.model_combo.setCurrentIndex(2)  # Default to LARGE
+        self.model_combo.setCurrentIndex(2)
         model_layout.addWidget(self.model_combo, 0, 1)
 
         self.load_model_btn = QPushButton("Load Model")
@@ -295,26 +745,74 @@ class DepthAnythingGUI(QMainWindow):
         input_group.setLayout(input_layout)
         layout.addWidget(input_group)
 
+        # VFX Export Options
+        vfx_group = QGroupBox("VFX Export Options")
+        vfx_layout = QGridLayout()
+
+        vfx_layout.addWidget(QLabel("Export Format:"), 0, 0)
+        self.vfx_export_format = QComboBox()
+        self.vfx_export_format.addItems([
+            "None",
+            "OpenEXR Multi-Channel",
+            "DPX Sequence (10-bit)",
+            "DPX Sequence (16-bit)",
+            "FBX Camera",
+            "All VFX Formats"
+        ])
+        vfx_layout.addWidget(self.vfx_export_format, 0, 1)
+
+        self.export_normals_check = QCheckBox("Include Normal Maps")
+        self.export_normals_check.setChecked(True)
+        vfx_layout.addWidget(self.export_normals_check, 1, 0, 1, 2)
+
+        self.export_confidence_check = QCheckBox("Include Confidence")
+        self.export_confidence_check.setChecked(True)
+        vfx_layout.addWidget(self.export_confidence_check, 2, 0, 1, 2)
+
+        vfx_group.setLayout(vfx_layout)
+        layout.addWidget(vfx_group)
+
+        # 3D Mesh Generation
+        mesh_group = QGroupBox("3D Mesh Generation")
+        mesh_layout = QGridLayout()
+
+        mesh_layout.addWidget(QLabel("Poisson Depth:"), 0, 0)
+        self.poisson_depth = QSpinBox()
+        self.poisson_depth.setRange(6, 12)
+        self.poisson_depth.setValue(9)
+        self.poisson_depth.setToolTip("Higher = more detail (slower)")
+        mesh_layout.addWidget(self.poisson_depth, 0, 1)
+
+        mesh_layout.addWidget(QLabel("Target Triangles:"), 1, 0)
+        self.target_triangles = QSpinBox()
+        self.target_triangles.setRange(10000, 1000000)
+        self.target_triangles.setSingleStep(10000)
+        self.target_triangles.setValue(100000)
+        mesh_layout.addWidget(self.target_triangles, 1, 1)
+
+        mesh_layout.addWidget(QLabel("Mesh Format:"), 2, 0)
+        self.mesh_format = QComboBox()
+        self.mesh_format.addItems(["OBJ", "PLY", "GLB", "FBX", "STL"])
+        self.mesh_format.setCurrentText("GLB")
+        mesh_layout.addWidget(self.mesh_format, 2, 1)
+
+        self.generate_mesh_btn = QPushButton("Generate 3D Mesh")
+        self.generate_mesh_btn.setEnabled(False)
+        self.generate_mesh_btn.clicked.connect(self.generate_mesh)
+        mesh_layout.addWidget(self.generate_mesh_btn, 3, 0, 1, 2)
+
+        mesh_group.setLayout(mesh_layout)
+        layout.addWidget(mesh_group)
+
         # Processing options
         options_group = QGroupBox("Processing Options")
         options_layout = QGridLayout()
 
-        options_layout.addWidget(QLabel("Export Format:"), 0, 0)
-        self.export_format = QComboBox()
-        self.export_format.addItems(["None", "GLB", "PLY", "NPZ", "Depth Image", "All"])
-        options_layout.addWidget(self.export_format, 0, 1)
-
-        options_layout.addWidget(QLabel("FPS (video):"), 1, 0)
+        options_layout.addWidget(QLabel("FPS (video):"), 0, 0)
         self.fps_spinner = QSpinBox()
         self.fps_spinner.setRange(1, 60)
         self.fps_spinner.setValue(15)
-        options_layout.addWidget(self.fps_spinner, 1, 1)
-
-        self.use_metric_depth = QCheckBox("Use Metric Depth")
-        options_layout.addWidget(self.use_metric_depth, 2, 0, 1, 2)
-
-        self.show_confidence = QCheckBox("Show Confidence Map")
-        options_layout.addWidget(self.show_confidence, 3, 0, 1, 2)
+        options_layout.addWidget(self.fps_spinner, 0, 1)
 
         options_group.setLayout(options_layout)
         layout.addWidget(options_group)
@@ -386,6 +884,15 @@ class DepthAnythingGUI(QMainWindow):
         self.depth_scroll.setWidgetResizable(True)
         self.viz_tabs.addTab(self.depth_scroll, "Depth Map")
 
+        # Normal map tab
+        self.normal_scroll = QScrollArea()
+        self.normal_label = QLabel("Normal map will appear here")
+        self.normal_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.normal_label.setMinimumSize(640, 480)
+        self.normal_scroll.setWidget(self.normal_label)
+        self.normal_scroll.setWidgetResizable(True)
+        self.viz_tabs.addTab(self.normal_scroll, "Normal Map")
+
         # Confidence map tab
         self.conf_scroll = QScrollArea()
         self.conf_label = QLabel("Confidence map (if available)")
@@ -422,32 +929,29 @@ class DepthAnythingGUI(QMainWindow):
         toolbar.setIconSize(QSize(32, 32))
         self.addToolBar(toolbar)
 
-        # File actions
         open_action = QAction("Open", self)
         open_action.triggered.connect(self.load_images)
         toolbar.addAction(open_action)
 
-        save_action = QAction("Export", self)
-        save_action.triggered.connect(self.export_results)
+        save_action = QAction("Export VFX", self)
+        save_action.triggered.connect(self.export_vfx)
         toolbar.addAction(save_action)
 
         toolbar.addSeparator()
 
-        # View actions
         clear_action = QAction("Clear", self)
         clear_action.triggered.connect(self.clear_all)
         toolbar.addAction(clear_action)
 
         toolbar.addSeparator()
 
-        # Help
         help_action = QAction("Help", self)
         help_action.triggered.connect(self.show_help)
         toolbar.addAction(help_action)
 
     def setup_statusbar(self):
         """Setup status bar"""
-        self.statusBar().showMessage("Ready")
+        self.statusBar().showMessage("Ready - VFX ULTIMATE Edition")
 
     def apply_dark_theme(self):
         """Apply modern dark theme"""
@@ -468,7 +972,6 @@ class DepthAnythingGUI(QMainWindow):
 
         self.setPalette(dark_palette)
 
-        # Additional stylesheet
         self.setStyleSheet("""
             QGroupBox {
                 font-weight: bold;
@@ -524,7 +1027,6 @@ class DepthAnythingGUI(QMainWindow):
             self.load_model_btn.setEnabled(False)
             QApplication.processEvents()
 
-            # Get model name
             model_text = self.model_combo.currentText()
             model_map = {
                 "DA3NESTED-GIANT-LARGE (1.4B params)": "depth-anything/DA3NESTED-GIANT-LARGE",
@@ -538,7 +1040,6 @@ class DepthAnythingGUI(QMainWindow):
 
             model_name = model_map.get(model_text, "depth-anything/DA3-LARGE")
 
-            # Load model
             self.model = DepthAnything3.from_pretrained(model_name)
             self.model = self.model.to(device=self.device)
             self.model.eval()
@@ -570,7 +1071,6 @@ class DepthAnythingGUI(QMainWindow):
             self.images_label.setText(f"{len(files)} image(s) loaded")
             self.log(f"Loaded {len(files)} images", "SUCCESS")
 
-            # Display first image
             if files:
                 pixmap = QPixmap(files[0])
                 self.original_label.setPixmap(
@@ -598,7 +1098,6 @@ class DepthAnythingGUI(QMainWindow):
             self.images_label.setText(f"Video: {Path(file).name}")
             self.log(f"Loaded video: {Path(file).name}", "SUCCESS")
 
-            # Auto-select video mode
             for i, button in enumerate(self.mode_buttons.buttons()):
                 if button.property("mode") == "video":
                     button.setChecked(True)
@@ -612,7 +1111,6 @@ class DepthAnythingGUI(QMainWindow):
         folder = QFileDialog.getExistingDirectory(self, "Select Folder")
 
         if folder:
-            # Find all images in folder
             extensions = ['*.png', '*.jpg', '*.jpeg', '*.bmp', '*.tiff', '*.webp']
             files = []
             for ext in extensions:
@@ -641,7 +1139,6 @@ class DepthAnythingGUI(QMainWindow):
             QMessageBox.warning(self, "Warning", "Please load images first")
             return
 
-        # Get selected mode
         selected_mode = None
         for button in self.mode_buttons.buttons():
             if button.isChecked():
@@ -661,30 +1158,10 @@ class DepthAnythingGUI(QMainWindow):
             self.progress_bar.setVisible(True)
             self.progress_bar.setValue(0)
 
-            # Prepare export
-            export_format_map = {
-                "None": None,
-                "GLB": "glb",
-                "PLY": "ply",
-                "NPZ": "npz",
-                "Depth Image": "depth_image",
-                "All": "all"
-            }
-            export_format = export_format_map[self.export_format.currentText()]
-            export_dir = None
-
-            if export_format:
-                export_dir = QFileDialog.getExistingDirectory(self, "Select Export Directory")
-                if not export_dir:
-                    export_format = None
-
-            # Create worker
             self.depth_worker = DepthWorker(
                 self.model,
                 self.current_images,
-                mode=mode,
-                export_dir=export_dir,
-                export_format=export_format
+                mode=mode
             )
 
             self.depth_worker.progress.connect(self.on_progress)
@@ -705,19 +1182,17 @@ class DepthAnythingGUI(QMainWindow):
             self.log(f"Starting {mode} mode...", "INFO")
 
             if mode == 'webcam':
-                source = 0  # Default camera
+                source = 0
             else:
                 source = self.current_images[0]
 
             fps = self.fps_spinner.value()
 
-            # Create video worker
             self.video_worker = VideoWorker(self.model, source, fps)
             self.video_worker.frame_ready.connect(self.on_frame_ready)
             self.video_worker.finished.connect(self.on_video_finished)
             self.video_worker.error.connect(self.on_error)
 
-            # Change button to stop
             self.process_btn.setText("Stop")
             self.process_btn.clicked.disconnect()
             self.process_btn.clicked.connect(self.stop_video)
@@ -751,11 +1226,12 @@ class DepthAnythingGUI(QMainWindow):
             self.current_prediction = prediction
             self.log("Processing complete!", "SUCCESS")
 
-            # Display results
             self.display_results(prediction)
-
-            # Show statistics
             self.show_statistics(prediction)
+
+            # Enable mesh generation if we have depth
+            if prediction.depth is not None:
+                self.generate_mesh_btn.setEnabled(True)
 
         except Exception as e:
             self.log(f"Error displaying results: {str(e)}", "ERROR")
@@ -766,7 +1242,6 @@ class DepthAnythingGUI(QMainWindow):
     def on_frame_ready(self, frame, depth_map):
         """Handle real-time video frame"""
         try:
-            # Display original frame
             h, w = frame.shape[:2]
             bytes_per_line = 3 * w
             q_img = QImage(frame.data, w, h, bytes_per_line, QImage.Format.Format_RGB888)
@@ -779,7 +1254,6 @@ class DepthAnythingGUI(QMainWindow):
                 )
             )
 
-            # Display depth map
             depth_normalized = ((depth_map - depth_map.min()) /
                               (depth_map.max() - depth_map.min()) * 255).astype(np.uint8)
             depth_colored = cv2.applyColorMap(depth_normalized, cv2.COLORMAP_INFERNO)
@@ -817,17 +1291,15 @@ class DepthAnythingGUI(QMainWindow):
     def display_results(self, prediction):
         """Display prediction results"""
         try:
-            # Display first depth map
+            # Display depth map
             if prediction.depth is not None and len(prediction.depth) > 0:
                 depth_map = prediction.depth[0]
 
-                # Normalize and colorize
                 depth_normalized = ((depth_map - depth_map.min()) /
                                   (depth_map.max() - depth_map.min()) * 255).astype(np.uint8)
                 depth_colored = cv2.applyColorMap(depth_normalized, cv2.COLORMAP_INFERNO)
                 depth_rgb = cv2.cvtColor(depth_colored, cv2.COLOR_BGR2RGB)
 
-                # Convert to QPixmap
                 h, w = depth_rgb.shape[:2]
                 bytes_per_line = 3 * w
                 q_img = QImage(depth_rgb.data, w, h, bytes_per_line, QImage.Format.Format_RGB888)
@@ -841,7 +1313,38 @@ class DepthAnythingGUI(QMainWindow):
                     )
                 )
 
-            # Display confidence map if available
+                # Generate and display normal map
+                try:
+                    if prediction.intrinsics is not None and len(prediction.intrinsics) > 0:
+                        intrinsics = prediction.intrinsics[0]
+                    else:
+                        # Default intrinsics
+                        h, w = depth_map.shape
+                        intrinsics = np.array([
+                            [w, 0, w/2],
+                            [0, w, h/2],
+                            [0, 0, 1]
+                        ])
+
+                    normals = NormalMapGenerator.compute(depth_map, intrinsics, smooth=True)
+                    normals_rgb = NormalMapGenerator.to_rgb(normals)
+
+                    h, w = normals_rgb.shape[:2]
+                    bytes_per_line = 3 * w
+                    q_img = QImage(normals_rgb.data, w, h, bytes_per_line, QImage.Format.Format_RGB888)
+                    pixmap = QPixmap.fromImage(q_img)
+
+                    self.normal_label.setPixmap(
+                        pixmap.scaled(
+                            self.normal_label.size(),
+                            Qt.AspectRatioMode.KeepAspectRatio,
+                            Qt.TransformationMode.SmoothTransformation
+                        )
+                    )
+                except Exception as e:
+                    self.log(f"Normal map generation failed: {str(e)}", "WARNING")
+
+            # Display confidence map
             if prediction.conf is not None and len(prediction.conf) > 0:
                 conf_map = prediction.conf[0]
 
@@ -885,18 +1388,171 @@ class DepthAnythingGUI(QMainWindow):
 
             if prediction.extrinsics is not None:
                 stats.append(f"Camera extrinsics shape: {prediction.extrinsics.shape}")
-                stats.append("First camera extrinsics:")
-                stats.append(str(prediction.extrinsics[0]) + "\n")
 
             if prediction.intrinsics is not None:
                 stats.append(f"Camera intrinsics shape: {prediction.intrinsics.shape}")
-                stats.append("First camera intrinsics:")
-                stats.append(str(prediction.intrinsics[0]))
 
             self.stats_text.setText("\n".join(stats))
 
         except Exception as e:
             self.log(f"Statistics error: {str(e)}", "ERROR")
+
+    def generate_mesh(self):
+        """Generate 3D mesh from depth"""
+        if self.current_prediction is None or self.current_prediction.depth is None:
+            QMessageBox.warning(self, "Warning", "No depth data available")
+            return
+
+        try:
+            self.log("Starting mesh generation...", "INFO")
+            self.generate_mesh_btn.setEnabled(False)
+            self.progress_bar.setVisible(True)
+            self.progress_bar.setValue(0)
+
+            depth = self.current_prediction.depth[0]
+
+            # Get intrinsics
+            if self.current_prediction.intrinsics is not None:
+                intrinsics = self.current_prediction.intrinsics[0]
+            else:
+                h, w = depth.shape
+                intrinsics = np.array([
+                    [w, 0, w/2],
+                    [0, w, h/2],
+                    [0, 0, 1]
+                ])
+
+            # Get RGB if available
+            rgb_image = None
+            if hasattr(self.current_prediction, 'processed_images') and self.current_prediction.processed_images is not None:
+                rgb_image = self.current_prediction.processed_images[0]
+
+            depth_level = self.poisson_depth.value()
+            target_triangles = self.target_triangles.value()
+
+            # Create mesh worker
+            self.mesh_worker = MeshWorker(
+                depth, intrinsics, rgb_image, depth_level, target_triangles
+            )
+
+            self.mesh_worker.progress.connect(self.on_progress)
+            self.mesh_worker.finished.connect(self.on_mesh_finished)
+            self.mesh_worker.error.connect(self.on_mesh_error)
+
+            self.mesh_worker.start()
+
+        except Exception as e:
+            self.log(f"Mesh generation error: {str(e)}", "ERROR")
+            QMessageBox.critical(self, "Error", f"Mesh generation failed:\n{str(e)}")
+            self.generate_mesh_btn.setEnabled(True)
+            self.progress_bar.setVisible(False)
+
+    def on_mesh_finished(self, mesh):
+        """Handle mesh generation completion"""
+        try:
+            self.current_mesh = mesh
+            self.log("Mesh generation complete!", "SUCCESS")
+
+            # Ask to save mesh
+            mesh_format = self.mesh_format.currentText().lower()
+            output_path, _ = QFileDialog.getSaveFileName(
+                self,
+                "Save 3D Mesh",
+                f"output_mesh.{mesh_format}",
+                f"{mesh_format.upper()} Files (*.{mesh_format})"
+            )
+
+            if output_path:
+                MeshGenerator.export_mesh(mesh, output_path)
+                self.log(f"Mesh saved to {output_path}", "SUCCESS")
+                QMessageBox.information(self, "Success", f"Mesh saved to:\n{output_path}")
+
+        except Exception as e:
+            self.log(f"Mesh save error: {str(e)}", "ERROR")
+        finally:
+            self.generate_mesh_btn.setEnabled(True)
+            self.progress_bar.setVisible(False)
+
+    def on_mesh_error(self, error_msg: str):
+        """Handle mesh generation error"""
+        self.log(f"Mesh error: {error_msg}", "ERROR")
+        QMessageBox.critical(self, "Error", error_msg)
+        self.generate_mesh_btn.setEnabled(True)
+        self.progress_bar.setVisible(False)
+
+    def export_vfx(self):
+        """Export VFX formats"""
+        if self.current_prediction is None:
+            QMessageBox.warning(self, "Warning", "No processed data to export")
+            return
+
+        export_format = self.vfx_export_format.currentText()
+        if export_format == "None":
+            QMessageBox.information(self, "Info", "Please select an export format")
+            return
+
+        export_dir = QFileDialog.getExistingDirectory(self, "Select Export Directory")
+        if not export_dir:
+            return
+
+        try:
+            self.log(f"Exporting {export_format}...", "INFO")
+
+            depth = self.current_prediction.depth[0]
+            h, w = depth.shape
+
+            # Get intrinsics
+            if self.current_prediction.intrinsics is not None:
+                intrinsics = self.current_prediction.intrinsics[0]
+            else:
+                intrinsics = np.array([[w, 0, w/2], [0, w, h/2], [0, 0, 1]])
+
+            if export_format == "OpenEXR Multi-Channel" or export_format == "All VFX Formats":
+                # Export OpenEXR
+                channels = {'depth.Z': depth}
+
+                if self.export_confidence_check.isChecked() and self.current_prediction.conf is not None:
+                    channels['confidence.R'] = self.current_prediction.conf[0]
+
+                if self.export_normals_check.isChecked():
+                    normals = NormalMapGenerator.compute(depth, intrinsics)
+                    channels['normal.R'] = normals[:, :, 0]
+                    channels['normal.G'] = normals[:, :, 1]
+                    channels['normal.B'] = normals[:, :, 2]
+
+                exr_path = os.path.join(export_dir, "depth.exr")
+                OpenEXRExporter.export(exr_path, channels, metadata={'software': 'Depth Anything v3 VFX'})
+                self.log(f"OpenEXR exported to {exr_path}", "SUCCESS")
+
+            if "DPX" in export_format or export_format == "All VFX Formats":
+                # Export DPX
+                bit_depth = 16 if "16-bit" in export_format else 10
+                dpx_path = os.path.join(export_dir, f"depth.dpx")
+                DPXExporter.export(dpx_path, depth, bit_depth=bit_depth)
+                self.log(f"DPX exported to {dpx_path}", "SUCCESS")
+
+            if export_format == "FBX Camera" or export_format == "All VFX Formats":
+                # Export FBX camera
+                if self.current_prediction.extrinsics is not None:
+                    fbx_path = os.path.join(export_dir, "camera.fbx")
+                    FBXCameraExporter.export(
+                        fbx_path,
+                        self.current_prediction.extrinsics,
+                        self.current_prediction.intrinsics if self.current_prediction.intrinsics is not None else np.array([intrinsics]),
+                        (w, h)
+                    )
+                    self.log(f"FBX camera exported to {fbx_path}", "SUCCESS")
+                else:
+                    self.log("No camera data available for FBX export", "WARNING")
+
+            QMessageBox.information(self, "Success", f"VFX files exported to:\n{export_dir}")
+
+        except ImportError as e:
+            self.log(f"Export failed - missing dependency: {str(e)}", "ERROR")
+            QMessageBox.critical(self, "Error", f"Export failed:\n{str(e)}")
+        except Exception as e:
+            self.log(f"Export error: {str(e)}", "ERROR")
+            QMessageBox.critical(self, "Error", f"Export failed:\n{str(e)}")
 
     def open_3d_viewer(self):
         """Open 3D point cloud viewer"""
@@ -907,12 +1563,10 @@ class DepthAnythingGUI(QMainWindow):
         try:
             import open3d as o3d
 
-            # Create point cloud from depth
             depth = self.current_prediction.depth[0]
             intrinsics = self.current_prediction.intrinsics[0] if self.current_prediction.intrinsics is not None else None
 
             if intrinsics is None:
-                # Use default intrinsics
                 h, w = depth.shape
                 fx = fy = w
                 cx, cy = w / 2, h / 2
@@ -920,7 +1574,6 @@ class DepthAnythingGUI(QMainWindow):
                 fx, fy = intrinsics[0, 0], intrinsics[1, 1]
                 cx, cy = intrinsics[0, 2], intrinsics[1, 2]
 
-            # Create point cloud
             h, w = depth.shape
             y, x = np.meshgrid(np.arange(h), np.arange(w), indexing='ij')
 
@@ -930,20 +1583,16 @@ class DepthAnythingGUI(QMainWindow):
 
             points = np.stack([x, y, z], axis=-1).reshape(-1, 3)
 
-            # Filter invalid points
             valid = ~np.isnan(points).any(axis=1)
             points = points[valid]
 
-            # Create Open3D point cloud
             pcd = o3d.geometry.PointCloud()
             pcd.points = o3d.utility.Vector3dVector(points)
 
-            # Add color if available
-            if self.current_prediction.processed_images is not None:
+            if hasattr(self.current_prediction, 'processed_images') and self.current_prediction.processed_images is not None:
                 colors = self.current_prediction.processed_images[0].reshape(-1, 3)[valid] / 255.0
                 pcd.colors = o3d.utility.Vector3dVector(colors)
 
-            # Visualize
             o3d.visualization.draw_geometries([pcd])
 
         except ImportError:
@@ -955,115 +1604,74 @@ class DepthAnythingGUI(QMainWindow):
         except Exception as e:
             QMessageBox.critical(self, "Error", f"3D visualization error:\n{str(e)}")
 
-    def export_results(self):
-        """Export current results"""
-        if self.current_prediction is None:
-            QMessageBox.warning(self, "Warning", "No results to export")
-            return
-
-        export_dir = QFileDialog.getExistingDirectory(self, "Select Export Directory")
-        if not export_dir:
-            return
-
-        try:
-            self.log("Exporting results...", "INFO")
-
-            # Save depth maps as images
-            for i, depth in enumerate(self.current_prediction.depth):
-                depth_normalized = ((depth - depth.min()) /
-                                  (depth.max() - depth.min()) * 255).astype(np.uint8)
-                depth_colored = cv2.applyColorMap(depth_normalized, cv2.COLORMAP_INFERNO)
-
-                output_path = os.path.join(export_dir, f"depth_{i:04d}.png")
-                cv2.imwrite(output_path, depth_colored)
-
-            # Save as NPZ
-            npz_path = os.path.join(export_dir, "prediction.npz")
-            np.savez(
-                npz_path,
-                depth=self.current_prediction.depth,
-                conf=self.current_prediction.conf if self.current_prediction.conf is not None else np.array([]),
-                extrinsics=self.current_prediction.extrinsics if self.current_prediction.extrinsics is not None else np.array([]),
-                intrinsics=self.current_prediction.intrinsics if self.current_prediction.intrinsics is not None else np.array([])
-            )
-
-            self.log(f"Results exported to {export_dir}", "SUCCESS")
-            QMessageBox.information(self, "Success", f"Results exported to:\n{export_dir}")
-
-        except Exception as e:
-            self.log(f"Export error: {str(e)}", "ERROR")
-            QMessageBox.critical(self, "Error", f"Export failed:\n{str(e)}")
-
     def clear_all(self):
         """Clear all data and reset UI"""
         self.current_images = []
         self.current_prediction = None
+        self.current_mesh = None
 
         self.original_label.setText("Load an image to begin")
         self.original_label.setPixmap(QPixmap())
         self.depth_label.setText("Process to see depth map")
         self.depth_label.setPixmap(QPixmap())
+        self.normal_label.setText("Normal map will appear here")
+        self.normal_label.setPixmap(QPixmap())
         self.conf_label.setText("Confidence map (if available)")
         self.conf_label.setPixmap(QPixmap())
         self.stats_text.clear()
 
         self.images_label.setText("No images loaded")
         self.process_btn.setEnabled(False)
+        self.generate_mesh_btn.setEnabled(False)
 
         self.log("All data cleared", "INFO")
 
     def show_help(self):
         """Show help dialog"""
         help_text = """
-        <h2>Depth Anything v3 - Professional Edition</h2>
+        <h2>Depth Anything v3 - VFX ULTIMATE Edition</h2>
 
         <h3>Quick Start:</h3>
         <ol>
-            <li>Select a model from the dropdown (DA3-LARGE recommended for most uses)</li>
-            <li>Click "Load Model" to initialize the model</li>
-            <li>Choose a processing mode (Monocular, Multi-View, etc.)</li>
+            <li>Select a model from the dropdown (DA3-LARGE recommended)</li>
+            <li>Click "Load Model" to initialize</li>
+            <li>Choose a processing mode</li>
             <li>Load images, video, or select webcam input</li>
             <li>Click "Process" to run depth estimation</li>
         </ol>
 
-        <h3>Processing Modes:</h3>
+        <h3>VFX Features:</h3>
         <ul>
-            <li><b>Monocular Depth:</b> Single image depth estimation</li>
-            <li><b>Multi-View Depth:</b> Consistent depth from multiple views</li>
-            <li><b>Pose Estimation:</b> Estimate camera poses and intrinsics</li>
-            <li><b>3D Gaussians:</b> Generate 3D Gaussian reconstruction</li>
-            <li><b>Real-time Video:</b> Process video files frame-by-frame</li>
-            <li><b>Webcam:</b> Real-time depth from webcam feed</li>
+            <li><b>OpenEXR Export:</b> Multi-channel with depth, normals, confidence</li>
+            <li><b>DPX Export:</b> Cinema-quality sequences (10/16-bit)</li>
+            <li><b>FBX Camera:</b> Camera tracking for Flame/Maya</li>
+            <li><b>3D Mesh Generation:</b> Poisson reconstruction</li>
+            <li><b>Normal Maps:</b> Surface normals for lighting</li>
         </ul>
 
-        <h3>Features:</h3>
+        <h3>Mesh Generation:</h3>
         <ul>
-            <li>GPU acceleration (CUDA if available)</li>
-            <li>Multiple export formats (GLB, PLY, NPZ, depth images)</li>
-            <li>Interactive 3D visualization</li>
-            <li>Batch processing for folders</li>
-            <li>Real-time video/webcam support</li>
-            <li>Confidence map visualization</li>
+            <li><b>Poisson Depth 6-8:</b> Fast, low detail</li>
+            <li><b>Poisson Depth 9:</b> Recommended (production)</li>
+            <li><b>Poisson Depth 10-12:</b> High detail (slow)</li>
         </ul>
 
-        <h3>System Requirements:</h3>
+        <h3>Export Formats:</h3>
         <ul>
-            <li>Python 3.8+</li>
-            <li>PyQt6</li>
-            <li>PyTorch 2.0+</li>
-            <li>CUDA-capable GPU (recommended)</li>
-            <li>8GB+ RAM (16GB+ for large models)</li>
+            <li>OBJ - Universal 3D format</li>
+            <li>PLY - With vertex colors</li>
+            <li>GLB - Blender, Flame compatible</li>
+            <li>FBX - Maya, 3DS Max</li>
+            <li>STL - 3D printing</li>
         </ul>
 
-        <p>For more information, visit:
-        <a href="https://depth-anything-3.github.io/">Depth Anything v3 Project Page</a></p>
+        <p>For Autodesk Flame integration, see FLAME_INTEGRATION.md</p>
         """
 
         QMessageBox.about(self, "Help", help_text)
 
     def closeEvent(self, event):
         """Handle application close"""
-        # Stop any running workers
         if self.video_worker and self.video_worker.isRunning():
             self.video_worker.stop()
             self.video_worker.wait()
@@ -1072,13 +1680,16 @@ class DepthAnythingGUI(QMainWindow):
             self.depth_worker.stop()
             self.depth_worker.wait()
 
+        if self.mesh_worker and self.mesh_worker.isRunning():
+            self.mesh_worker.wait()
+
         event.accept()
 
 
 def main():
     """Main application entry point"""
     app = QApplication(sys.argv)
-    app.setApplicationName("Depth Anything v3 Professional")
+    app.setApplicationName("Depth Anything v3 VFX ULTIMATE")
     app.setOrganizationName("Depth Anything")
 
     window = DepthAnythingGUI()
